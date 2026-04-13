@@ -22,6 +22,7 @@ HEADERS = {
 FRED_API_BASE = "https://api.stlouisfed.org/fred/series/observations"
 FRED_CSV_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 FRED_API_KEY  = os.environ.get("FRED_API_KEY", "")
+MACRO_PATH    = "data/macro.json"
 
 
 def save(path: str, data: object):
@@ -30,6 +31,15 @@ def save(path: str, data: object):
         json.dump(data, f, separators=(",", ":"))
     size_kb = os.path.getsize(path) // 1024
     print(f"  Saved {path} ({size_kb} KB)")
+
+
+def load_existing() -> dict:
+    """Load the previous macro.json so we can preserve fields that fail to fetch."""
+    try:
+        with open(MACRO_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
 def parse_fred_csv(text: str) -> list:
@@ -102,46 +112,67 @@ def main():
     print(f"=== fetch_daily.py (macro)  {ts} ===")
     now = datetime.now(timezone.utc)
 
-    def fetch_indicator(series: str, label: str, unit: str, years: int) -> dict | None:
-        try:
-            start = (now - timedelta(days=years * 365)).strftime("%Y-%m-%d")
-            points = fetch_fred(series, start)
-            if not points:
-                print(f"  WARN {series}: empty")
-                return None
-            last = points[-1]
-            return {
-                "label":   label,
-                "value":   last["y"],
-                "unit":    unit,
-                "date":    display_date(last["x"]),
-                "history": points,
-            }
-        except Exception as e:
-            print(f"  ERROR {series}: {e}")
-            return None
+    # Load previous data so nulls fall back to last known good value
+    previous = load_existing()
 
-    def fetch_cpi(years: int) -> dict | None:
-        try:
-            start = (now - timedelta(days=(years + 1) * 365)).strftime("%Y-%m-%d")
-            points = fetch_fred("CPIAUCSL", start)
-            if len(points) < 13:
-                return None
-            yoy = calc_cpi_yoy(points)
-            last = yoy[-1]
-            return {
-                "label":   "CPI Inflation (YoY)",
-                "value":   last["y"],
-                "unit":    "%",
-                "date":    display_date(points[-1]["x"]),
-                "history": yoy,
-            }
-        except Exception as e:
-            print(f"  ERROR CPI: {e}")
-            return None
+    def fetch_indicator(series: str, label: str, unit: str, years: int,
+                        retries: int = 3, retry_delay: int = 10) -> dict | None:
+        start = (now - timedelta(days=years * 365)).strftime("%Y-%m-%d")
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                points = fetch_fred(series, start)
+                if not points:
+                    print(f"  WARN {series}: empty (attempt {attempt})")
+                    last_err = "empty response"
+                    time.sleep(retry_delay)
+                    continue
+                last = points[-1]
+                return {
+                    "label":   label,
+                    "value":   last["y"],
+                    "unit":    unit,
+                    "date":    display_date(last["x"]),
+                    "history": points,
+                }
+            except Exception as e:
+                last_err = e
+                print(f"  ERROR {series} (attempt {attempt}): {e}")
+                if attempt < retries:
+                    time.sleep(retry_delay)
+        print(f"  FAILED {series} after {retries} attempts: {last_err}")
+        return None
+
+    def fetch_cpi(years: int, retries: int = 3, retry_delay: int = 10) -> dict | None:
+        start = (now - timedelta(days=(years + 1) * 365)).strftime("%Y-%m-%d")
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                points = fetch_fred("CPIAUCSL", start)
+                if len(points) < 13:
+                    last_err = f"only {len(points)} points"
+                    print(f"  WARN CPIAUCSL: too few points (attempt {attempt})")
+                    time.sleep(retry_delay)
+                    continue
+                yoy = calc_cpi_yoy(points)
+                last = yoy[-1]
+                return {
+                    "label":   "CPI Inflation (YoY)",
+                    "value":   last["y"],
+                    "unit":    "%",
+                    "date":    display_date(points[-1]["x"]),
+                    "history": yoy,
+                }
+            except Exception as e:
+                last_err = e
+                print(f"  ERROR CPI (attempt {attempt}): {e}")
+                if attempt < retries:
+                    time.sleep(retry_delay)
+        print(f"  FAILED CPI after {retries} attempts: {last_err}")
+        return None
 
     print("Fetching FRED indicators...")
-    macro = {
+    fresh = {
         "fetched_at":         int(time.time() * 1000),
         "fed_rate":           fetch_indicator("FEDFUNDS", "Fed Funds Rate",       "%",   years=10),
         "cpi":                fetch_cpi(years=12),
@@ -150,8 +181,14 @@ def main():
         "yield_curve":        fetch_indicator("T10Y2Y",   "Yield Curve (10Y-2Y)", "%",   years=10),
         "consumer_sentiment": fetch_indicator("UMCSENT",  "Consumer Sentiment",   "pts", years=10),
     }
-    save("data/macro.json", macro)
 
+    # For any field that failed to fetch, keep the last known good value
+    for key in ("fed_rate", "cpi", "unemployment", "yield10y", "yield_curve", "consumer_sentiment"):
+        if fresh[key] is None and previous.get(key) is not None:
+            print(f"  FALLBACK {key}: using previous value ({previous[key].get('value')})")
+            fresh[key] = previous[key]
+
+    save(MACRO_PATH, fresh)
     print("=== Done ===")
 
 
