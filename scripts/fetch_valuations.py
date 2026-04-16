@@ -3,6 +3,7 @@
 Runs once daily. Fetches valuation indicators:
   - CAPE & Shiller P/E         (multpl.com shiller-pe, monthly)
   - Price-to-Book              (multpl.com s-p-500-price-to-book, quarterly)
+  - Tobin's Q                  (FRED: MVEONWMVBSNNCB / TNWBSNNCB, quarterly)
   - Fed Balance Sheet (WALCL)  (FRED)
   - M2 Money Supply  (M2SL)    (FRED)
 
@@ -239,6 +240,48 @@ def scrape_multpl(slug: str, label: str, unit: str, years: int = 20,
 
 
 # ---------------------------------------------------------------------------
+# Tobin's Q: MVEONWMVBSNNCB (market value equities, $B) / TNWBSNNCB (net worth, $B)
+# Both series are quarterly; we align by exact date match.
+# ---------------------------------------------------------------------------
+
+def fetch_tobins_q(years: int = 20) -> dict | None:
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=years * 365)).strftime("%Y-%m-%d")
+    try:
+        mve = fetch_fred("MVEONWMVBSNNCB", start)
+        tnw = fetch_fred("TNWBSNNCB", start)
+    except Exception as e:
+        print(f"  FAILED Tobin's Q fetch: {e}")
+        return None
+
+    if not mve or not tnw:
+        print("  FAILED Tobin's Q: empty series")
+        return None
+
+    # Build lookup by timestamp for TNW
+    tnw_map = {p["x"]: p["y"] for p in tnw}
+    points = []
+    for p in mve:
+        denom = tnw_map.get(p["x"])
+        if denom and denom != 0.0:
+            points.append({"x": p["x"], "y": round(p["y"] / denom, 4)})
+
+    if not points:
+        print("  FAILED Tobin's Q: no overlapping dates")
+        return None
+
+    points.sort(key=lambda p: p["x"])
+    last = points[-1]
+    return {
+        "label":   "Tobin's Q",
+        "value":   last["y"],
+        "unit":    "x",
+        "date":    display_date_monthly(last["x"]),
+        "history": points,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Fed balance sheet conversion: WALCL is in millions → convert to trillions
 # ---------------------------------------------------------------------------
 
@@ -296,17 +339,20 @@ def main():
     print("Fetching M2 Money Supply (FRED M2SL)...")
     m2 = fetch_m2(years=20)
 
+    print("Fetching Tobin's Q (FRED MVEONWMVBSNNCB / TNWBSNNCB)...")
+    tobins_q = fetch_tobins_q(years=20)
+
     fresh = {
         "fetched_at":        int(time.time() * 1000),
         "cape":              cape,
         "price_to_book":     ptb,
-        "tobins_q":          None,
+        "tobins_q":          tobins_q,
         "fed_balance_sheet": fed_bs,
         "m2":                m2,
     }
 
     # Fall back to previous for any field that failed
-    for key in ("cape", "price_to_book", "fed_balance_sheet", "m2"):
+    for key in ("cape", "price_to_book", "tobins_q", "fed_balance_sheet", "m2"):
         if fresh[key] is None and previous.get(key) is not None:
             print(f"  FALLBACK {key}: using previous value ({previous[key].get('value')})")
             fresh[key] = previous[key]
