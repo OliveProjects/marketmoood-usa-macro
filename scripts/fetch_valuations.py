@@ -244,29 +244,75 @@ def scrape_multpl(slug: str, label: str, unit: str, years: int = 20,
 # Both series are quarterly; we align by exact date match.
 # ---------------------------------------------------------------------------
 
+def _fetch_fred_raw(series: str, start_date: str) -> str:
+    """Returns raw CSV text from FRED or raises. Prints diagnostic on unexpected response."""
+    if FRED_API_KEY:
+        r = requests.get(
+            FRED_API_BASE,
+            params={"series_id": series, "observation_start": start_date,
+                    "file_type": "json", "api_key": FRED_API_KEY},
+            headers=HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        obs = r.json().get("observations", [])
+        if not obs:
+            raise ValueError(f"API returned 0 observations for {series}")
+        # Convert to CSV-like text for parse_fred_csv
+        lines = ["observation_date," + series]
+        for o in obs:
+            lines.append(f"{o['date']},{o['value']}")
+        return "\n".join(lines)
+
+    r = requests.get(
+        FRED_CSV_BASE,
+        params={"id": series, "observation_start": start_date},
+        headers=HEADERS, timeout=20,
+    )
+    print(f"  {series}: HTTP {r.status_code}, body_start={r.text[:120]!r}")
+    r.raise_for_status()
+    if not r.text.startswith('"observation_date"') and not r.text.startswith("observation_date"):
+        raise ValueError(f"FRED CSV unexpected response: {r.text[:120]!r}")
+    return r.text
+
+
+def _try_fetch_series(candidates: list[str], start_date: str) -> list:
+    """Try each series ID in order, return the first that succeeds."""
+    for series in candidates:
+        try:
+            raw = _fetch_fred_raw(series, start_date)
+            pts = parse_fred_csv(raw)
+            if pts:
+                print(f"  OK {series}: {len(pts)} pts, last={pts[-1]}")
+                return pts
+            print(f"  {series}: parsed 0 points")
+        except Exception as e:
+            print(f"  {series}: ERROR {e}")
+    return []
+
+
 def fetch_tobins_q(years: int = 20) -> dict | None:
     now = datetime.now(timezone.utc)
     start = (now - timedelta(days=years * 365)).strftime("%Y-%m-%d")
-    try:
-        mve = fetch_fred("MVEONWMVBSNNCB", start)
-        tnw = fetch_fred("TNWBSNNCB", start)
-    except Exception as e:
-        print(f"  FAILED Tobin's Q fetch: {e}")
-        return None
+
+    # Market value of equities — try multiple known FRED series in order
+    mve_candidates = ["MVEONWMVBSNNCB", "BOGZ1FL103164003Q", "NCBEILQ027S"]
+    # Net worth at replacement cost
+    tnw_candidates = ["TNWBSNNCB", "BOGZ1FL102090005Q", "NCBEILQ027S"]
+
+    print("  Trying MVE series...")
+    mve = _try_fetch_series(mve_candidates, start)
+    print("  Trying TNW series...")
+    tnw = _try_fetch_series(tnw_candidates, start)
 
     if not mve or not tnw:
-        print(f"  FAILED Tobin's Q: empty series (mve={len(mve) if mve else 0}, tnw={len(tnw) if tnw else 0})")
+        print(f"  FAILED Tobin's Q: could not fetch series (mve={len(mve)}, tnw={len(tnw)})")
         return None
-
-    print(f"  MVE: {len(mve)} pts, first={mve[0]}, last={mve[-1]}")
-    print(f"  TNW: {len(tnw)} pts, first={tnw[0]}, last={tnw[-1]}")
 
     # Match by nearest date within 46 days (handles quarter-start vs quarter-end offsets)
     WINDOW_MS = 46 * 24 * 60 * 60 * 1000
     tnw_sorted = sorted(tnw, key=lambda p: p["x"])
     points = []
     for p in mve:
-        # Binary-search closest TNW point
         lo, hi = 0, len(tnw_sorted) - 1
         best = None
         while lo <= hi:
@@ -288,7 +334,7 @@ def fetch_tobins_q(years: int = 20) -> dict | None:
         print("  FAILED Tobin's Q: no matching dates within 46-day window")
         return None
 
-    print(f"  Tobin's Q: {len(points)} points, latest Q={points[-1]['y']}")
+    print(f"  Tobin's Q OK: {len(points)} points, latest Q={points[-1]['y']}")
     points.sort(key=lambda p: p["x"])
     last = points[-1]
     return {
