@@ -255,21 +255,40 @@ def fetch_tobins_q(years: int = 20) -> dict | None:
         return None
 
     if not mve or not tnw:
-        print("  FAILED Tobin's Q: empty series")
+        print(f"  FAILED Tobin's Q: empty series (mve={len(mve) if mve else 0}, tnw={len(tnw) if tnw else 0})")
         return None
 
-    # Build lookup by timestamp for TNW
-    tnw_map = {p["x"]: p["y"] for p in tnw}
+    print(f"  MVE: {len(mve)} pts, first={mve[0]}, last={mve[-1]}")
+    print(f"  TNW: {len(tnw)} pts, first={tnw[0]}, last={tnw[-1]}")
+
+    # Match by nearest date within 46 days (handles quarter-start vs quarter-end offsets)
+    WINDOW_MS = 46 * 24 * 60 * 60 * 1000
+    tnw_sorted = sorted(tnw, key=lambda p: p["x"])
     points = []
     for p in mve:
-        denom = tnw_map.get(p["x"])
-        if denom and denom != 0.0:
-            points.append({"x": p["x"], "y": round(p["y"] / denom, 4)})
+        # Binary-search closest TNW point
+        lo, hi = 0, len(tnw_sorted) - 1
+        best = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            diff = abs(tnw_sorted[mid]["x"] - p["x"])
+            if best is None or diff < abs(tnw_sorted[best]["x"] - p["x"]):
+                best = mid
+            if tnw_sorted[mid]["x"] < p["x"]:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best is not None:
+            denom = tnw_sorted[best]["y"]
+            dist = abs(tnw_sorted[best]["x"] - p["x"])
+            if denom != 0.0 and dist <= WINDOW_MS:
+                points.append({"x": p["x"], "y": round(p["y"] / denom, 4)})
 
     if not points:
-        print("  FAILED Tobin's Q: no overlapping dates")
+        print("  FAILED Tobin's Q: no matching dates within 46-day window")
         return None
 
+    print(f"  Tobin's Q: {len(points)} points, latest Q={points[-1]['y']}")
     points.sort(key=lambda p: p["x"])
     last = points[-1]
     return {
