@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Runs once daily. Fetches valuation indicators:
-  - CAPE / Shiller P/E         (multpl.com shiller-pe, monthly)
+  - CAPE & Shiller P/E         (multpl.com shiller-pe, monthly)
   - Price-to-Book              (multpl.com s-p-500-price-to-book, quarterly)
   - Fed Balance Sheet (WALCL)  (FRED)
   - M2 Money Supply  (M2SL)    (FRED)
@@ -283,7 +283,7 @@ def main():
     previous = load_existing()
 
     print("Fetching CAPE (multpl.com)...")
-    cape = scrape_multpl("shiller-pe", "CAPE / Shiller P/E", "x", years=20)
+    cape = scrape_multpl("shiller-pe", "CAPE & Shiller P/E", "x", years=20)
     time.sleep(3)
 
     print("Fetching Price-to-Book (multpl.com)...")
