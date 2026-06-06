@@ -184,10 +184,17 @@ def fetch_events(now: datetime) -> dict | None:
                 except (ValueError, TypeError):
                     return str(val)
 
+            time_raw = item.get("time", "") or ""
+            date_raw = item.get("date", "") or ""
+            # Finnhub returns full datetime in 'time' ("2026-06-10 12:30:00"), 'date' is often empty
+            if not date_raw and len(time_raw) >= 10:
+                date_raw = time_raw[:10]
+            time_only = time_raw[11:] if len(time_raw) > 10 else time_raw
+
             events.append({
                 "event":    item.get("event", ""),
-                "date":     item.get("date", ""),
-                "time":     item.get("time", ""),
+                "date":     date_raw,
+                "time":     time_only,
                 "category": _categorize(item.get("event", "")),
                 "estimate": fmt(estimate),
                 "previous": fmt(previous),
