@@ -152,7 +152,7 @@ def fetch_events(now: datetime) -> dict | None:
         print("  WARN: FINNHUB_API_KEY not set — skipping events.json")
         return None
 
-    from_date = now.strftime("%Y-%m-%d")
+    from_date = now.replace(day=1).strftime("%Y-%m-%d")  # start of current month to capture past events
     to_date   = (now + timedelta(days=90)).strftime("%Y-%m-%d")
 
     try:
