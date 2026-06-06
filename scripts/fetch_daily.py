@@ -21,11 +21,13 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-FRED_API_BASE   = "https://api.stlouisfed.org/fred/series/observations"
-FRED_CSV_BASE   = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-FRED_API_KEY    = os.environ.get("FRED_API_KEY", "")
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
-MACRO_PATH      = "data/macro.json"
+FRED_API_BASE        = "https://api.stlouisfed.org/fred/series/observations"
+FRED_CSV_BASE        = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+FRED_API_KEY         = os.environ.get("FRED_API_KEY", "")
+FINNHUB_API_KEY      = os.environ.get("FINNHUB_API_KEY", "")
+ALTERNATIVE_ME_FNG   = "https://api.alternative.me/fng/"
+MACRO_PATH           = "data/macro.json"
+CRYPTO_PATH          = "data/crypto.json"
 
 
 def save(path: str, data: object):
@@ -216,6 +218,72 @@ def fetch_events(now: datetime) -> dict | None:
         return None
 
 
+# ── Alternative.me Crypto Fear & Greed ───────────────────────────────────────
+
+def fetch_crypto_fg(retries: int = 3, retry_delay: int = 10) -> dict | None:
+    """
+    Fetches the full Crypto Fear & Greed history from alternative.me and
+    returns a payload ready to be written to data/crypto.json.
+
+    API docs: https://alternative.me/crypto/fear-and-greed-index/
+    Attribution is required next to any display of this data.
+    No API key needed.
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(
+                ALTERNATIVE_ME_FNG,
+                params={"limit": 0, "format": "json"},
+                headers=HEADERS,
+                timeout=20,
+            )
+            r.raise_for_status()
+            raw  = r.json()
+            data = raw.get("data", [])
+            if not data:
+                last_err = "empty data array"
+                print(f"  WARN crypto F&G: empty (attempt {attempt})")
+                time.sleep(retry_delay)
+                continue
+
+            # API returns newest-first; sort ascending for charting
+            points = sorted(
+                [
+                    {"x": int(o["timestamp"]) * 1000, "y": int(o["value"])}
+                    for o in data
+                    if o.get("timestamp") and o.get("value")
+                ],
+                key=lambda p: p["x"],
+            )
+
+            latest = data[0]  # still newest-first in original list
+            print(f"  Crypto F&G: {latest['value']} ({latest['value_classification']})  — {len(points)} history points")
+
+            return {
+                "fetched_at":      int(time.time() * 1000),
+                "source":          "alternative.me",
+                "source_url":      "https://alternative.me/crypto/fear-and-greed-index/",
+                "crypto_fg": {
+                    "label":          "Crypto Fear & Greed",
+                    "value":          int(latest["value"]),
+                    "classification": latest.get("value_classification", ""),
+                    "unit":           "",
+                    "date":           display_date(points[-1]["x"]),
+                    "history":        points,
+                },
+            }
+
+        except Exception as e:
+            last_err = e
+            print(f"  ERROR crypto F&G (attempt {attempt}): {e}")
+            if attempt < retries:
+                time.sleep(retry_delay)
+
+    print(f"  FAILED crypto F&G after {retries} attempts: {last_err}")
+    return None
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -307,6 +375,12 @@ def main():
     events = fetch_events(now)
     if events is not None:
         save("data/events.json", events)
+
+    # ── crypto.json ──
+    print("Fetching Crypto Fear & Greed (alternative.me)...")
+    crypto = fetch_crypto_fg()
+    if crypto is not None:
+        save(CRYPTO_PATH, crypto)
 
     print("=== Done ===")
 
