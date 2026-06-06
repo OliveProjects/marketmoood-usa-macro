@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Runs once daily after US market close.
-Fetches all FRED macro indicators: Fed funds rate, CPI, unemployment,
-10Y Treasury yield, yield curve (10Y-2Y), consumer sentiment.
+
+Outputs:
+  data/macro.json   – FRED macro indicators (Fed rate, CPI, unemployment, yields, sentiment)
+  data/events.json  – Upcoming high-impact US economic events (Finnhub)
 """
 
 import json
@@ -19,10 +21,11 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-FRED_API_BASE = "https://api.stlouisfed.org/fred/series/observations"
-FRED_CSV_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-FRED_API_KEY  = os.environ.get("FRED_API_KEY", "")
-MACRO_PATH    = "data/macro.json"
+FRED_API_BASE   = "https://api.stlouisfed.org/fred/series/observations"
+FRED_CSV_BASE   = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+FRED_API_KEY    = os.environ.get("FRED_API_KEY", "")
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
+MACRO_PATH      = "data/macro.json"
 
 
 def save(path: str, data: object):
@@ -41,6 +44,8 @@ def load_existing() -> dict:
     except Exception:
         return {}
 
+
+# ── FRED helpers ──────────────────────────────────────────────────────────────
 
 def parse_fred_csv(text: str) -> list:
     lines = text.strip().splitlines()
@@ -107,10 +112,109 @@ def display_date(ts_ms: int) -> str:
     return datetime.utcfromtimestamp(ts_ms / 1000).strftime("%b %Y")
 
 
+# ── Finnhub events ────────────────────────────────────────────────────────────
+
+_RELEVANT = [
+    "interest rate", "fomc", "federal reserve", "fed rate",
+    "cpi", "core cpi", "pce", "core pce", "inflation",
+    "gdp", "gross domestic",
+    "nonfarm payroll", "unemployment rate",
+]
+
+_CATEGORY_KEYWORDS = {
+    "fed":       ["interest rate", "fomc", "federal reserve", "fed rate"],
+    "inflation": ["cpi", "pce", "inflation"],
+    "gdp":       ["gdp", "gross domestic"],
+    "jobs":      ["nonfarm payroll", "unemployment rate"],
+}
+
+
+def _categorize(name: str) -> str:
+    lower = name.lower()
+    for cat, keywords in _CATEGORY_KEYWORDS.items():
+        if any(k in lower for k in keywords):
+            return cat
+    return "macro"
+
+
+def _is_relevant(item: dict) -> bool:
+    country = item.get("country", "").upper()
+    if country not in ("US", "USA"):
+        return False
+    if item.get("impact", "").lower() != "high":
+        return False
+    name = item.get("event", "").lower()
+    return any(k in name for k in _RELEVANT)
+
+
+def fetch_events(now: datetime) -> dict | None:
+    if not FINNHUB_API_KEY:
+        print("  WARN: FINNHUB_API_KEY not set — skipping events.json")
+        return None
+
+    from_date = now.strftime("%Y-%m-%d")
+    to_date   = (now + timedelta(days=90)).strftime("%Y-%m-%d")
+
+    try:
+        r = requests.get(
+            "https://finnhub.io/api/v1/calendar/economic",
+            params={"from": from_date, "to": to_date, "token": FINNHUB_API_KEY},
+            headers=HEADERS,
+            timeout=20,
+        )
+        r.raise_for_status()
+        raw   = r.json()
+        items = raw.get("economicCalendar", raw if isinstance(raw, list) else [])
+
+        events = []
+        for item in items:
+            if not _is_relevant(item):
+                continue
+
+            estimate = item.get("estimate")
+            previous = item.get("prev")
+            actual   = item.get("actual")
+            unit     = item.get("unit", "")
+
+            def fmt(val) -> str | None:
+                if val is None or val == "":
+                    return None
+                try:
+                    return f"{float(val):.2f}{unit}".rstrip("0").rstrip(".")
+                except (ValueError, TypeError):
+                    return str(val)
+
+            events.append({
+                "event":    item.get("event", ""),
+                "date":     item.get("date", ""),
+                "time":     item.get("time", ""),
+                "category": _categorize(item.get("event", "")),
+                "estimate": fmt(estimate),
+                "previous": fmt(previous),
+                "actual":   fmt(actual),
+            })
+
+        events.sort(key=lambda e: (e["date"], e["time"] or ""))
+        print(f"  Events: {len(events)} high-impact US events in next 90 days")
+
+        return {
+            "fetched_at": int(time.time() * 1000),
+            "from":       from_date,
+            "to":         to_date,
+            "events":     events,
+        }
+
+    except Exception as e:
+        print(f"  ERROR events: {e}")
+        return None
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"=== fetch_daily.py (macro)  {ts} ===")
+    ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     now = datetime.now(timezone.utc)
+    print(f"=== fetch_daily.py  {ts} ===")
 
     # Load previous data so nulls fall back to last known good value
     previous = load_existing()
@@ -171,6 +275,7 @@ def main():
         print(f"  FAILED CPI after {retries} attempts: {last_err}")
         return None
 
+    # ── macro.json ──
     print("Fetching FRED indicators...")
     fresh = {
         "fetched_at":         int(time.time() * 1000),
@@ -189,6 +294,13 @@ def main():
             fresh[key] = previous[key]
 
     save(MACRO_PATH, fresh)
+
+    # ── events.json ──
+    print("Fetching upcoming events (Finnhub)...")
+    events = fetch_events(now)
+    if events is not None:
+        save("data/events.json", events)
+
     print("=== Done ===")
 
 

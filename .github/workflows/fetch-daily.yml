@@ -24,10 +24,11 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Fetch FRED macro data
+      - name: Fetch FRED macro data + Finnhub events
         run: python scripts/fetch_daily.py
         env:
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
 
       - name: Commit and push
         run: |
