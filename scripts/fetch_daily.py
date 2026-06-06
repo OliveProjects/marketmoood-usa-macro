@@ -118,14 +118,14 @@ _RELEVANT = [
     "interest rate", "fomc", "federal reserve", "fed rate",
     "cpi", "core cpi", "pce", "core pce", "inflation",
     "gdp", "gross domestic",
-    "nonfarm payroll", "unemployment rate",
+    "nonfarm payroll", "non farm payroll", "payrolls", "unemployment rate",
 ]
 
 _CATEGORY_KEYWORDS = {
     "fed":       ["interest rate", "fomc", "federal reserve", "fed rate"],
     "inflation": ["cpi", "pce", "inflation"],
     "gdp":       ["gdp", "gross domestic"],
-    "jobs":      ["nonfarm payroll", "unemployment rate"],
+    "jobs":      ["nonfarm payroll", "non farm payroll", "payrolls", "unemployment rate"],
 }
 
 
@@ -143,7 +143,7 @@ def _is_relevant(item: dict) -> bool:
         return False
     if item.get("impact", "").lower() != "high":
         return False
-    name = item.get("event", "").lower()
+    name = item.get("event", "").lower().replace("-", " ")  # normalise "Non-Farm" → "Non Farm"
     return any(k in name for k in _RELEVANT)
 
 
