@@ -4,13 +4,15 @@ Runs once daily after US market close.
 
 Outputs:
   data/macro.json   – FRED macro indicators (Fed rate, CPI, unemployment, yields, sentiment)
-  data/events.json  – Upcoming high-impact US economic events (Finnhub)
+  data/events.json  – Upcoming high-impact US economic events (BLS / Fed / BEA)
 """
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone, timedelta
+from html.parser import HTMLParser
 
 import requests
 
@@ -24,7 +26,6 @@ HEADERS = {
 FRED_API_BASE        = "https://api.stlouisfed.org/fred/series/observations"
 FRED_CSV_BASE        = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 FRED_API_KEY         = os.environ.get("FRED_API_KEY", "")
-FINNHUB_API_KEY      = os.environ.get("FINNHUB_API_KEY", "")
 ALTERNATIVE_ME_FNG   = "https://api.alternative.me/fng/"
 MACRO_PATH           = "data/macro.json"
 CRYPTO_PATH          = "data/crypto.json"
@@ -114,116 +115,215 @@ def display_date(ts_ms: int) -> str:
     return datetime.utcfromtimestamp(ts_ms / 1000).strftime("%b %Y")
 
 
-# ── Finnhub events ────────────────────────────────────────────────────────────
+# ── Official US economic calendar (BLS / Fed / BEA) ──────────────────────────
 
-_RELEVANT = [
-    "interest rate", "fomc", "federal reserve", "fed rate",
-    "cpi", "core cpi", "pce", "core pce", "inflation",
-    "gdp", "gross domestic",
-    "nonfarm payroll", "non farm payroll", "payrolls", "unemployment rate",
-]
+class _TableParser(HTMLParser):
+    """Collects plain text from HTML table cells."""
+    def __init__(self):
+        super().__init__()
+        self.rows: list[list[str]] = []
+        self._row:  list[str] | None = None
+        self._cell: str | None = None
 
-_CATEGORY_KEYWORDS = {
-    "fed":       ["interest rate", "fomc", "federal reserve", "fed rate"],
-    "inflation": ["cpi", "pce", "inflation"],
-    "gdp":       ["gdp", "gross domestic"],
-    "jobs":      ["nonfarm payroll", "non farm payroll", "payrolls", "unemployment rate"],
-}
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = ""
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None:
+            self._row.append(self._cell.strip())
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if any(c.strip() for c in self._row):
+                self.rows.append(self._row)
+            self._row = None
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell += data
 
 
-def _categorize(name: str) -> str:
-    lower = name.lower()
-    for cat, keywords in _CATEGORY_KEYWORDS.items():
-        if any(k in lower for k in keywords):
-            return cat
-    return "macro"
+def _to_iso(text: str) -> str | None:
+    """Parse 'July 15, 2026' or 'Jul 15, 2026' → '2026-07-15'."""
+    text = text.strip()
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d,%Y"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
 
 
-def _is_relevant(item: dict) -> bool:
-    country = item.get("country", "").upper()
-    if country not in ("US", "USA"):
-        return False
-    if item.get("impact", "").lower() != "high":
-        return False
-    name = item.get("event", "").lower().replace("-", " ")  # normalise "Non-Farm" → "Non Farm"
-    return any(k in name for k in _RELEVANT)
+def _event(label: str, date_iso: str, release_time: str, category: str) -> dict:
+    return {
+        "event": label, "date": date_iso, "time": release_time,
+        "category": category, "estimate": None, "previous": None, "actual": None,
+    }
+
+
+def _fomc_events(now: datetime, cutoff: datetime) -> list[dict]:
+    """Fetch FOMC meeting end-dates (= rate decision day) from federalreserve.gov."""
+    try:
+        r = requests.get(
+            "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+            headers=HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        months_pat = (
+            "January|February|March|April|May|June|July|"
+            "August|September|October|November|December"
+        )
+        today_str  = now.strftime("%Y-%m-%d")
+        cutoff_str = cutoff.strftime("%Y-%m-%d")
+        events: list[dict] = []
+        seen: set[str] = set()
+        # Matches "January 28-29, 2026" or "July 29-30* 2026" anywhere in page
+        for m in re.finditer(
+            rf'\b({months_pat})\s+(\d{{1,2}})\s*[-–]\s*(\d{{1,2}})\*?,?\s*(20\d\d)',
+            r.text,
+        ):
+            month_name, _day1, day2, year = m.groups()
+            try:
+                date_iso = datetime.strptime(
+                    f"{month_name} {day2} {year}", "%B %d %Y"
+                ).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+            if date_iso < today_str or date_iso > cutoff_str or date_iso in seen:
+                continue
+            seen.add(date_iso)
+            events.append(_event("Fed Interest Rate Decision", date_iso, "18:00:00", "fed"))
+        print(f"  FOMC: {len(events)} upcoming")
+        return events
+    except Exception as e:
+        print(f"  WARN FOMC: {type(e).__name__}: {e}")
+        return []
+
+
+def _bls_events(now: datetime, cutoff: datetime) -> list[dict]:
+    """Fetch CPI and NFP release dates from the BLS news release schedule."""
+    TARGETS = {
+        "consumer price index": ("Inflation Rate (CPI)", "inflation", "12:30:00"),
+        "employment situation": ("Non Farm Payrolls",    "jobs",      "12:30:00"),
+    }
+    today_str  = now.strftime("%Y-%m-%d")
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+    events: list[dict] = []
+    try:
+        r = requests.get(
+            "https://www.bls.gov/schedule/news_release/",
+            headers=HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        parser = _TableParser()
+        parser.feed(r.text)
+        seen: set[tuple] = set()
+        for row in parser.rows:
+            if len(row) < 2:
+                continue
+            name_lower = row[0].lower()
+            match = next(
+                ((k, v) for k, v in TARGETS.items() if k in name_lower), None
+            )
+            if not match:
+                continue
+            _, (label, category, release_time) = match
+            date_iso = None
+            for cell in row[1:]:
+                date_iso = _to_iso(cell)
+                if date_iso:
+                    break
+            if not date_iso or date_iso < today_str or date_iso > cutoff_str:
+                continue
+            key = (date_iso, label)
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(_event(label, date_iso, release_time, category))
+        print(f"  BLS: {len(events)} upcoming")
+    except Exception as e:
+        print(f"  WARN BLS: {type(e).__name__}: {e}")
+    return events
+
+
+def _bea_events(now: datetime, cutoff: datetime) -> list[dict]:
+    """Fetch GDP and PCE release dates from BEA news release schedule."""
+    TARGETS = {
+        "gross domestic product":           ("GDP Growth Rate",      "gdp",       "12:30:00"),
+        "personal income and outlays":      ("Core PCE Price Index", "inflation", "12:30:00"),
+        "personal consumption expenditure": ("Core PCE Price Index", "inflation", "12:30:00"),
+    }
+    today_str  = now.strftime("%Y-%m-%d")
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+    events: list[dict] = []
+    try:
+        r = requests.get(
+            "https://www.bea.gov/news/schedule",
+            headers=HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        parser = _TableParser()
+        parser.feed(r.text)
+        seen: set[tuple] = set()
+        for row in parser.rows:
+            if len(row) < 2:
+                continue
+            name_lower = row[0].lower()
+            match = next(
+                ((k, v) for k, v in TARGETS.items() if k in name_lower), None
+            )
+            if not match:
+                continue
+            _, (label, category, release_time) = match
+            date_iso = None
+            for cell in row[1:]:
+                date_iso = _to_iso(cell)
+                if date_iso:
+                    break
+            if not date_iso or date_iso < today_str or date_iso > cutoff_str:
+                continue
+            key = (date_iso, label)
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(_event(label, date_iso, release_time, category))
+        print(f"  BEA: {len(events)} upcoming")
+    except Exception as e:
+        print(f"  WARN BEA: {type(e).__name__}: {e}")
+    return events
 
 
 def fetch_events(now: datetime) -> dict | None:
-    if not FINNHUB_API_KEY:
-        print("  WARN: FINNHUB_API_KEY not set — skipping events.json")
-        return None
-
-    from_date = now.replace(day=1).strftime("%Y-%m-%d")  # start of current month to capture past events
+    from_date = now.replace(day=1).strftime("%Y-%m-%d")
     to_date   = (now + timedelta(days=90)).strftime("%Y-%m-%d")
+    cutoff    = now + timedelta(days=90)
 
-    try:
-        r = requests.get(
-            "https://finnhub.io/api/v1/calendar/economic",
-            params={"from": from_date, "to": to_date, "token": FINNHUB_API_KEY},
-            headers=HEADERS,
-            timeout=20,
-        )
-        if not r.ok:
-            print(f"  ERROR events: HTTP {r.status_code} — {r.text[:300]}")
-            return None
-        raw   = r.json()
-        items = raw.get("economicCalendar", raw if isinstance(raw, list) else [])
-        print(f"  Finnhub raw items: {len(items)} total (before filter, {from_date} → {to_date})")
-        if items:
-            sample = items[:3]
-            for s in sample:
-                print(f"    sample: {s.get('date') or s.get('time','')[:10]} | {s.get('event','')} | impact={s.get('impact','')} | country={s.get('country','')}")
+    all_events = (
+        _fomc_events(now, cutoff)
+        + _bls_events(now, cutoff)
+        + _bea_events(now, cutoff)
+    )
 
-        events = []
-        for item in items:
-            if not _is_relevant(item):
-                continue
+    seen: set[tuple] = set()
+    events: list[dict] = []
+    for e in all_events:
+        key = (e["date"], e["event"])
+        if key not in seen:
+            seen.add(key)
+            events.append(e)
+    events.sort(key=lambda e: (e["date"], e.get("time") or ""))
 
-            estimate = item.get("estimate")
-            previous = item.get("prev")
-            actual   = item.get("actual")
-            unit     = item.get("unit", "")
+    future = [e for e in events if e["date"] >= now.strftime("%Y-%m-%d")]
+    print(f"  Events total: {len(events)} ({len(future)} upcoming)")
 
-            def fmt(val) -> str | None:
-                if val is None or val == "":
-                    return None
-                try:
-                    return f"{float(val):.2f}{unit}".rstrip("0").rstrip(".")
-                except (ValueError, TypeError):
-                    return str(val)
-
-            time_raw = item.get("time", "") or ""
-            date_raw = item.get("date", "") or ""
-            # Finnhub returns full datetime in 'time' ("2026-06-10 12:30:00"), 'date' is often empty
-            if not date_raw and len(time_raw) >= 10:
-                date_raw = time_raw[:10]
-            time_only = time_raw[11:] if len(time_raw) > 10 else time_raw
-
-            events.append({
-                "event":    item.get("event", ""),
-                "date":     date_raw,
-                "time":     time_only,
-                "category": _categorize(item.get("event", "")),
-                "estimate": fmt(estimate),
-                "previous": fmt(previous),
-                "actual":   fmt(actual),
-            })
-
-        events.sort(key=lambda e: (e["date"], e["time"] or ""))
-        future = [e for e in events if e["date"] >= now.strftime("%Y-%m-%d")]
-        print(f"  Events: {len(events)} matched filter, {len(future)} upcoming")
-
-        return {
-            "fetched_at": int(time.time() * 1000),
-            "from":       from_date,
-            "to":         to_date,
-            "events":     events,
-        }
-
-    except Exception as e:
-        print(f"  ERROR events: {type(e).__name__}: {e}")
-        return None
+    return {
+        "fetched_at": int(time.time() * 1000),
+        "from":       from_date,
+        "to":         to_date,
+        "events":     events,
+    }
 
 
 # ── Alternative.me Crypto Fear & Greed ───────────────────────────────────────
@@ -379,7 +479,7 @@ def main():
     save(MACRO_PATH, fresh)
 
     # ── events.json ──
-    print("Fetching upcoming events (Finnhub)...")
+    print("Fetching upcoming events (BLS / Fed / BEA)...")
     events = fetch_events(now)
     if events is not None:
         today_str = now.strftime("%Y-%m-%d")
