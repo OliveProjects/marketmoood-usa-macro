@@ -164,9 +164,16 @@ def fetch_events(now: datetime) -> dict | None:
             headers=HEADERS,
             timeout=20,
         )
-        r.raise_for_status()
+        if not r.ok:
+            print(f"  ERROR events: HTTP {r.status_code} — {r.text[:300]}")
+            return None
         raw   = r.json()
         items = raw.get("economicCalendar", raw if isinstance(raw, list) else [])
+        print(f"  Finnhub raw items: {len(items)} total (before filter, {from_date} → {to_date})")
+        if items:
+            sample = items[:3]
+            for s in sample:
+                print(f"    sample: {s.get('date') or s.get('time','')[:10]} | {s.get('event','')} | impact={s.get('impact','')} | country={s.get('country','')}")
 
         events = []
         for item in items:
@@ -204,7 +211,8 @@ def fetch_events(now: datetime) -> dict | None:
             })
 
         events.sort(key=lambda e: (e["date"], e["time"] or ""))
-        print(f"  Events: {len(events)} high-impact US events in next 90 days")
+        future = [e for e in events if e["date"] >= now.strftime("%Y-%m-%d")]
+        print(f"  Events: {len(events)} matched filter, {len(future)} upcoming")
 
         return {
             "fetched_at": int(time.time() * 1000),
@@ -214,7 +222,7 @@ def fetch_events(now: datetime) -> dict | None:
         }
 
     except Exception as e:
-        print(f"  ERROR events: {e}")
+        print(f"  ERROR events: {type(e).__name__}: {e}")
         return None
 
 
@@ -374,7 +382,19 @@ def main():
     print("Fetching upcoming events (Finnhub)...")
     events = fetch_events(now)
     if events is not None:
-        save("data/events.json", events)
+        today_str = now.strftime("%Y-%m-%d")
+        new_future = [e for e in events["events"] if e["date"] >= today_str]
+        # Load existing to compare
+        try:
+            with open("data/events.json") as f:
+                old = json.load(f)
+            old_future = [e for e in old.get("events", []) if e["date"] >= today_str]
+        except Exception:
+            old_future = []
+        if new_future or not old_future:
+            save("data/events.json", events)
+        else:
+            print(f"  WARN events: new fetch has 0 upcoming events but old has {len(old_future)} — keeping existing events.json")
 
     # ── crypto.json ──
     print("Fetching Crypto Fear & Greed (alternative.me)...")
