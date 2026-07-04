@@ -1,0 +1,55 @@
+name: Data Health Check
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 02:00 UTC — ~3.5h after the daily fetch at 22:20 UTC
+  workflow_dispatch:
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate JSON freshness and schema
+        run: |
+          python3 - <<'EOF'
+          import json, sys, time, urllib.request
+
+          BASE        = "https://oliveprojects.github.io/marketmoood-usa-macro/data"
+          MAX_AGE_H   = 48
+          now_ms      = time.time() * 1000
+          errors      = []
+
+          checks = [
+              ("events.json",     ["fetched_at", "events"]),
+              ("valuations.json", ["fetched_at", "cape"]),
+              ("fng_stats.json",  ["fetched_at", "baseline", "zones"]),
+          ]
+
+          for filename, required_fields in checks:
+              url = f"{BASE}/{filename}"
+              try:
+                  with urllib.request.urlopen(url, timeout=15) as r:
+                      data = json.loads(r.read())
+              except Exception as e:
+                  errors.append(f"{filename}: fetch failed — {e}")
+                  continue
+
+              for field in required_fields:
+                  if field not in data:
+                      errors.append(f"{filename}: missing required field '{field}'")
+
+              fetched_at = data.get("fetched_at", 0)
+              age_h = (now_ms - fetched_at) / 3_600_000
+              if age_h > MAX_AGE_H:
+                  errors.append(f"{filename}: stale — {age_h:.1f}h old (limit {MAX_AGE_H}h)")
+              else:
+                  print(f"  OK  {filename} ({age_h:.1f}h old)")
+
+          if errors:
+              print("\nHEALTH CHECK FAILED:")
+              for e in errors:
+                  print(f"  FAIL  {e}")
+              sys.exit(1)
+
+          print("All checks passed.")
+          EOF

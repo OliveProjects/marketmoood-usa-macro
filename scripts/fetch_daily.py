@@ -27,8 +27,11 @@ FRED_API_BASE        = "https://api.stlouisfed.org/fred/series/observations"
 FRED_CSV_BASE        = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 FRED_API_KEY         = os.environ.get("FRED_API_KEY", "")
 ALTERNATIVE_ME_FNG   = "https://api.alternative.me/fng/"
+CNN_FNG_HISTORY_URL  = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata/2021-01-01"
 MACRO_PATH           = "data/macro.json"
 CRYPTO_PATH          = "data/crypto.json"
+FNG_STATS_PATH       = "data/fng_stats.json"
+FNG_DEBOUNCE_DAYS    = 30
 
 
 def save(path: str, data: object):
@@ -326,6 +329,167 @@ def fetch_events(now: datetime) -> dict | None:
     }
 
 
+# ── F&G zone forward-return statistics ───────────────────────────────────────
+
+def _fng_classify(score: float) -> str:
+    if score < 25: return "Extreme Fear"
+    if score < 45: return "Fear"
+    if score < 56: return "Neutral"
+    if score < 75: return "Greed"
+    return "Extreme Greed"
+
+
+def _fng_debounced_entries(fng_points: list[dict], min_gap: int) -> list[dict]:
+    """One entry per zone per min_gap calendar days (avoids re-counting boundary churn)."""
+    last_entry: dict[str, str] = {}
+    entries: list[dict] = []
+    prev_zone: str | None = None
+    for p in fng_points:
+        z = _fng_classify(p["score"])
+        if z == prev_zone:
+            continue
+        prev_zone = z
+        last = last_entry.get(z)
+        if last is None or (datetime.strptime(p["date"], "%Y-%m-%d") -
+                            datetime.strptime(last, "%Y-%m-%d")).days >= min_gap:
+            entries.append({"date": p["date"], "score": p["score"], "zone": z})
+            last_entry[z] = p["date"]
+    return entries
+
+
+def compute_fng_stats() -> dict | None:
+    """
+    Fetches CNN F&G history + SPX from FRED, computes SPX forward-return
+    statistics per zone (debounced) plus an unconditional baseline,
+    and returns a JSON-serializable dict for fng_stats.json.
+
+    Design choices documented here so future maintainers know why:
+    - Debounce (30 days) avoids counting boundary churn as independent episodes.
+    - Baseline row lets users compare zone returns vs. "just hold the market".
+    - N is stored per horizon (not per zone) because the most recent entries
+      lack a complete forward window and are excluded from that horizon only.
+    - Returns are stored as % (e.g. 1.6 means +1.6%) for display convenience.
+    """
+    # ── CNN F&G history ───────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            CNN_FNG_HISTORY_URL,
+            headers={**HEADERS, "Referer": "https://edition.cnn.com/markets/fear-and-greed"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        raw = r.json()["fear_and_greed_historical"]["data"]
+        fng = sorted(
+            [{"date": datetime.utcfromtimestamp(p["x"] / 1000).strftime("%Y-%m-%d"),
+              "score": float(p["y"])} for p in raw],
+            key=lambda p: p["date"],
+        )
+        print(f"  F&G stats: {len(fng)} days ({fng[0]['date']} to {fng[-1]['date']})")
+    except Exception as e:
+        print(f"  WARN F&G stats history: {type(e).__name__}: {e}")
+        return None
+
+    # ── SPX from Yahoo Finance (no API key, faster than FRED CSV) ────────────
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
+            params={"interval": "1d", "period1": "1609459200", "period2": "9999999999"},
+            headers={**HEADERS, "Accept": "application/json"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        result     = r.json()["chart"]["result"][0]
+        timestamps = result["timestamp"]
+        closes     = result["indicators"]["quote"][0]["close"]
+        spx = {
+            datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"): price
+            for ts, price in zip(timestamps, closes)
+            if price is not None
+        }
+        print(f"  F&G stats SPX: {len(spx)} trading days")
+    except Exception as e:
+        print(f"  WARN F&G stats SPX: {type(e).__name__}: {e}")
+        return None
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    HORIZONS = [(30, "1M"), (91, "3M"), (182, "6M"), (365, "12M")]
+    ZONES    = ["Extreme Fear", "Fear", "Neutral", "Greed", "Extreme Greed"]
+
+    def nearest_spx(date_str: str) -> float | None:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        for offset in range(8):
+            d = (dt + timedelta(days=offset)).strftime("%Y-%m-%d")
+            if d in spx:
+                return spx[d]
+        return None
+
+    def fwd_date(date_str: str, cal_days: int) -> str:
+        return (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=cal_days)).strftime("%Y-%m-%d")
+
+    def horizon_stats(returns: list[float]) -> dict | None:
+        # avg and pct_positive are stored in PERCENT form, not fractions:
+        #   avg = 1.6 means +1.6%, NOT 0.016
+        #   pct_positive = 56.0 means 56%, NOT 0.56
+        # The Android app reads these values and formats them directly — do not change the unit.
+        if not returns:
+            return None
+        n   = len(returns)
+        avg = round(sum(returns) / n, 2)
+        pct = round(sum(1 for v in returns if v > 0) / n * 100, 1)
+        return {"n": n, "avg": avg, "pct_positive": pct}
+
+    # ── Zone entries (debounced) ──────────────────────────────────────────────
+    entries = _fng_debounced_entries(fng, FNG_DEBOUNCE_DAYS)
+
+    zone_returns: dict[str, dict[str, list[float]]] = {z: {h[1]: [] for h in HORIZONS} for z in ZONES}
+
+    for entry in entries:
+        base = nearest_spx(entry["date"])
+        if base is None:
+            continue
+        for cal_days, label in HORIZONS:
+            future = nearest_spx(fwd_date(entry["date"], cal_days))
+            if future is not None:
+                zone_returns[entry["zone"]][label].append(
+                    round((future / base - 1) * 100, 4)
+                )
+
+    # ── Baseline (all days in F&G window) ────────────────────────────────────
+    baseline_ret: dict[str, list[float]] = {h[1]: [] for h in HORIZONS}
+    for p in fng:
+        base = nearest_spx(p["date"])
+        if base is None:
+            continue
+        for cal_days, label in HORIZONS:
+            future = nearest_spx(fwd_date(p["date"], cal_days))
+            if future is not None:
+                baseline_ret[label].append(round((future / base - 1) * 100, 4))
+
+    # ── Build output ──────────────────────────────────────────────────────────
+    zones_out = []
+    for z in ZONES:
+        r_map = zone_returns[z]
+        n_zone = len(r_map["1M"])
+        zones_out.append({
+            "zone": z,
+            "n": n_zone,
+            "returns": {label: horizon_stats(r_map[label]) for _, label in HORIZONS},
+        })
+
+    return {
+        "fetched_at":    int(time.time() * 1000),
+        "from_date":     fng[0]["date"],
+        "to_date":       fng[-1]["date"],
+        "debounce_days": FNG_DEBOUNCE_DAYS,
+        "baseline": {
+            "zone":    "All days",
+            "n":       len(baseline_ret["1M"]),
+            "returns": {label: horizon_stats(baseline_ret[label]) for _, label in HORIZONS},
+        },
+        "zones": zones_out,
+    }
+
+
 # ── Alternative.me Crypto Fear & Greed ───────────────────────────────────────
 
 def fetch_crypto_fg(retries: int = 3, retry_delay: int = 10) -> dict | None:
@@ -495,6 +659,19 @@ def main():
             save("data/events.json", events)
         else:
             print(f"  WARN events: new fetch has 0 upcoming events but old has {len(old_future)} — keeping existing events.json")
+
+    # ── fng_stats.json ──
+    print("Computing F&G zone return statistics...")
+    fng_stats = compute_fng_stats()
+    if fng_stats is not None:
+        # Keep old file if new one has no zone data (e.g. FRED was down)
+        has_data = any(z["n"] > 0 for z in fng_stats.get("zones", []))
+        if has_data:
+            save(FNG_STATS_PATH, fng_stats)
+        else:
+            print("  WARN fng_stats: all zones have N=0 — keeping existing file")
+    else:
+        print("  WARN fng_stats: computation failed — keeping existing file")
 
     # ── crypto.json ──
     print("Fetching Crypto Fear & Greed (alternative.me)...")
