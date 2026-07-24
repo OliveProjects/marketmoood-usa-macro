@@ -298,28 +298,122 @@ def _bea_events(now: datetime, cutoff: datetime) -> list[dict]:
     return events
 
 
-def fetch_events(now: datetime) -> dict | None:
-    from_date = now.replace(day=1).strftime("%Y-%m-%d")
+# ── CURATED release calendar (supersedes the three scrapers above) ───────────
+# The Fed, BLS and BEA publish their release schedules a year ahead and rarely
+# change them. Scraping from CI proved unreliable: BLS returns 403 to datacenter
+# IPs, and the Fed/BEA HTML drifted so the parsers matched nothing — events.json
+# went silently empty. So the dates are curated here from the official schedules.
+# Each entry: (event label, YYYY-MM-DD, HH:MM:SS UTC, category, value-source key).
+# Times: BLS/BEA release 08:30 ET (~12:30 UTC); FOMC decision 14:00 ET (~18:00 UTC).
+# ⚠️ UPDATE ANNUALLY: append the next year's dates when the agencies publish them
+# (typically late in the current year). Sources:
+#   FOMC  federalreserve.gov/monetarypolicy/fomccalendars.htm
+#   CPI   bls.gov/schedule/news_release/cpi.htm
+#   NFP   bls.gov/schedule/news_release/empsit.htm
+#   GDP   bea.gov/news/schedule  ("GDP (Advance Estimate)")
+#   PCE   bea.gov/news/schedule  ("Personal Income and Outlays")
+CURATED_RELEASES: list[tuple] = [
+    ("Fed Interest Rate Decision", "2026-07-29", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2026-09-16", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2026-10-28", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2026-12-09", "18:00:00", "fed",       "fed_rate"),
+    ("Inflation Rate (CPI)",       "2026-07-14", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2026-08-12", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2026-09-11", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2026-10-14", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2026-11-10", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2026-12-10", "12:30:00", "inflation", "cpi"),
+    ("Non Farm Payrolls",          "2026-07-02", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2026-08-07", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2026-09-04", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2026-10-02", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2026-11-06", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2026-12-04", "12:30:00", "jobs",      "nfp"),
+    ("GDP Growth Rate",            "2026-07-30", "12:30:00", "gdp",       "gdp"),
+    ("GDP Growth Rate",            "2026-10-29", "12:30:00", "gdp",       "gdp"),
+    ("Core PCE Price Index",       "2026-08-04", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2026-09-03", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2026-10-06", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2026-11-04", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2026-12-02", "12:30:00", "inflation", "pce"),
+]
+
+
+def _fmt_pct(v: float, decimals: int = 1) -> str:
+    return f"{v:.{decimals}f}%"
+
+
+def _fmt_payroll(v: float) -> str:
+    # PAYEMS is in thousands of persons; the monthly change is the headline NFP.
+    return f"{'+' if v >= 0 else '-'}{abs(v):.0f}K"
+
+
+def fetch_event_values(now: datetime, macro: dict) -> dict:
+    """Return {source_key: (latest_str, previous_str)} to fill events' previous/
+    actual. Reuses macro.json indicators for Fed/CPI; fetches the extra FRED
+    series (payrolls, GDP growth, core PCE) that macro.json doesn't carry.
+    Each source degrades gracefully to (None, None) on failure."""
+    out: dict[str, tuple] = {"fed_rate": (None, None), "cpi": (None, None),
+                             "nfp": (None, None), "gdp": (None, None), "pce": (None, None)}
+
+    def _from_macro(key: str, decimals: int):
+        ind = macro.get(key) or {}
+        h = ind.get("history") or []
+        latest = _fmt_pct(h[-1]["y"], decimals) if len(h) >= 1 else None
+        prev   = _fmt_pct(h[-2]["y"], decimals) if len(h) >= 2 else None
+        return (latest, prev)
+
+    out["fed_rate"] = _from_macro("fed_rate", 2)   # effective rate, 2 decimals
+    out["cpi"]      = _from_macro("cpi", 1)         # YoY %, already computed
+
+    start = (now - timedelta(days=900)).strftime("%Y-%m-%d")
+
+    try:  # NFP — month-over-month change in total nonfarm payrolls (PAYEMS)
+        p = fetch_fred("PAYEMS", start)
+        if len(p) >= 3:
+            out["nfp"] = (_fmt_payroll(p[-1]["y"] - p[-2]["y"]),
+                          _fmt_payroll(p[-2]["y"] - p[-3]["y"]))
+    except Exception as e:
+        print(f"  WARN PAYEMS: {type(e).__name__}: {e}")
+
+    try:  # GDP — real GDP growth, annualized % (quarterly)
+        g = fetch_fred("A191RL1Q225SBEA", start)
+        if len(g) >= 2:
+            out["gdp"] = (_fmt_pct(g[-1]["y"]), _fmt_pct(g[-2]["y"]))
+    except Exception as e:
+        print(f"  WARN GDP growth: {type(e).__name__}: {e}")
+
+    try:  # Core PCE — YoY % from the core PCE price index (PCEPILFE)
+        yoy = calc_cpi_yoy(fetch_fred("PCEPILFE", start))
+        if len(yoy) >= 2:
+            out["pce"] = (_fmt_pct(yoy[-1]["y"]), _fmt_pct(yoy[-2]["y"]))
+    except Exception as e:
+        print(f"  WARN Core PCE: {type(e).__name__}: {e}")
+
+    return out
+
+
+def fetch_events(now: datetime, event_values: dict) -> dict | None:
+    from_date = now.replace(day=1).strftime("%Y-%m-%d")   # start of current month
     to_date   = (now + timedelta(days=90)).strftime("%Y-%m-%d")
-    cutoff    = now + timedelta(days=90)
+    today_str = now.strftime("%Y-%m-%d")
 
-    all_events = (
-        _fomc_events(now, cutoff)
-        + _bls_events(now, cutoff)
-        + _bea_events(now, cutoff)
-    )
-
-    seen: set[tuple] = set()
     events: list[dict] = []
-    for e in all_events:
-        key = (e["date"], e["event"])
-        if key not in seen:
-            seen.add(key)
-            events.append(e)
-    events.sort(key=lambda e: (e["date"], e.get("time") or ""))
+    for label, date_iso, rel_time, category, source in CURATED_RELEASES:
+        if date_iso < from_date or date_iso > to_date:
+            continue
+        e = _event(label, date_iso, rel_time, category)
+        latest, prev = event_values.get(source, (None, None))
+        if date_iso >= today_str:
+            e["previous"] = latest   # the last reading, shown ahead of the release
+        else:
+            e["actual"]   = latest   # this already-released reading
+            e["previous"] = prev
+        events.append(e)
 
-    future = [e for e in events if e["date"] >= now.strftime("%Y-%m-%d")]
-    print(f"  Events total: {len(events)} ({len(future)} upcoming)")
+    events.sort(key=lambda e: (e["date"], e.get("time") or ""))
+    future = [e for e in events if e["date"] >= today_str]
+    print(f"  Events: {len(events)} in window ({len(future)} upcoming) — curated schedule")
 
     return {
         "fetched_at": int(time.time() * 1000),
@@ -643,8 +737,8 @@ def main():
     save(MACRO_PATH, fresh)
 
     # ── events.json ──
-    print("Fetching upcoming events (BLS / Fed / BEA)...")
-    events = fetch_events(now)
+    print("Building economic calendar (curated schedule + FRED enrichment)...")
+    events = fetch_events(now, fetch_event_values(now, fresh))
     if events is not None:
         today_str = now.strftime("%Y-%m-%d")
         new_future = [e for e in events["events"] if e["date"] >= today_str]
