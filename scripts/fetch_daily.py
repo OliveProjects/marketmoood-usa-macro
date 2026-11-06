@@ -13,6 +13,7 @@ import re
 import time
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -304,7 +305,8 @@ def _bea_events(now: datetime, cutoff: datetime) -> list[dict]:
 # IPs, and the Fed/BEA HTML drifted so the parsers matched nothing — events.json
 # went silently empty. So the dates are curated here from the official schedules.
 # Each entry: (event label, YYYY-MM-DD, HH:MM:SS UTC, category, value-source key).
-# Times: BLS/BEA release 08:30 ET (~12:30 UTC); FOMC decision 14:00 ET (~18:00 UTC).
+# Times are UTC during US daylight saving: BLS/BEA release 08:30 ET (12:30 UTC),
+# FOMC decision 14:00 ET (18:00 UTC). _release_time_utc adds the hour for winter dates.
 # ⚠️ UPDATE ANNUALLY: append the next year's dates when the agencies publish them
 # (typically late in the current year). Sources:
 #   FOMC  federalreserve.gov/monetarypolicy/fomccalendars.htm
@@ -312,31 +314,91 @@ def _bea_events(now: datetime, cutoff: datetime) -> list[dict]:
 #   NFP   bls.gov/schedule/news_release/empsit.htm
 #   GDP   bea.gov/news/schedule  ("GDP (Advance Estimate)")
 #   PCE   bea.gov/news/schedule  ("Personal Income and Outlays")
+# BEA keeps next year on bea.gov/news/schedule/next-year, and it moves dates
+# within the year, so re-check the current year's BEA dates at the same time.
 CURATED_RELEASES: list[tuple] = [
     ("Fed Interest Rate Decision", "2026-07-29", "18:00:00", "fed",       "fed_rate"),
     ("Fed Interest Rate Decision", "2026-09-16", "18:00:00", "fed",       "fed_rate"),
     ("Fed Interest Rate Decision", "2026-10-28", "18:00:00", "fed",       "fed_rate"),
     ("Fed Interest Rate Decision", "2026-12-09", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2027-01-27", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2027-03-17", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2027-04-28", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2027-06-09", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2027-07-28", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2027-09-15", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2027-10-27", "18:00:00", "fed",       "fed_rate"),
+    ("Fed Interest Rate Decision", "2027-12-08", "18:00:00", "fed",       "fed_rate"),
     ("Inflation Rate (CPI)",       "2026-07-14", "12:30:00", "inflation", "cpi"),
     ("Inflation Rate (CPI)",       "2026-08-12", "12:30:00", "inflation", "cpi"),
     ("Inflation Rate (CPI)",       "2026-09-11", "12:30:00", "inflation", "cpi"),
     ("Inflation Rate (CPI)",       "2026-10-14", "12:30:00", "inflation", "cpi"),
     ("Inflation Rate (CPI)",       "2026-11-10", "12:30:00", "inflation", "cpi"),
     ("Inflation Rate (CPI)",       "2026-12-10", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-01-13", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-02-11", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-03-10", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-04-13", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-05-12", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-06-10", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-07-14", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-08-11", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-09-14", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-10-14", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-11-10", "12:30:00", "inflation", "cpi"),
+    ("Inflation Rate (CPI)",       "2027-12-10", "12:30:00", "inflation", "cpi"),
     ("Non Farm Payrolls",          "2026-07-02", "12:30:00", "jobs",      "nfp"),
     ("Non Farm Payrolls",          "2026-08-07", "12:30:00", "jobs",      "nfp"),
     ("Non Farm Payrolls",          "2026-09-04", "12:30:00", "jobs",      "nfp"),
     ("Non Farm Payrolls",          "2026-10-02", "12:30:00", "jobs",      "nfp"),
     ("Non Farm Payrolls",          "2026-11-06", "12:30:00", "jobs",      "nfp"),
     ("Non Farm Payrolls",          "2026-12-04", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-01-08", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-02-05", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-03-05", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-04-02", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-05-07", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-06-04", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-07-02", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-08-06", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-09-03", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-10-08", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-11-05", "12:30:00", "jobs",      "nfp"),
+    ("Non Farm Payrolls",          "2027-12-03", "12:30:00", "jobs",      "nfp"),
     ("GDP Growth Rate",            "2026-07-30", "12:30:00", "gdp",       "gdp"),
     ("GDP Growth Rate",            "2026-10-29", "12:30:00", "gdp",       "gdp"),
-    ("Core PCE Price Index",       "2026-08-04", "12:30:00", "inflation", "pce"),
-    ("Core PCE Price Index",       "2026-09-03", "12:30:00", "inflation", "pce"),
-    ("Core PCE Price Index",       "2026-10-06", "12:30:00", "inflation", "pce"),
-    ("Core PCE Price Index",       "2026-11-04", "12:30:00", "inflation", "pce"),
-    ("Core PCE Price Index",       "2026-12-02", "12:30:00", "inflation", "pce"),
+    ("GDP Growth Rate",            "2027-01-28", "12:30:00", "gdp",       "gdp"),
+    ("GDP Growth Rate",            "2027-04-29", "12:30:00", "gdp",       "gdp"),
+    ("GDP Growth Rate",            "2027-07-29", "12:30:00", "gdp",       "gdp"),
+    ("GDP Growth Rate",            "2027-10-28", "12:30:00", "gdp",       "gdp"),
+    ("Core PCE Price Index",       "2026-07-30", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2026-08-26", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2026-09-30", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2026-10-29", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2026-11-25", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2026-12-23", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-01-28", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-02-25", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-03-31", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-04-29", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-05-27", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-06-25", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-07-29", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-08-25", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-09-30", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-10-28", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-11-24", "12:30:00", "inflation", "pce"),
+    ("Core PCE Price Index",       "2027-12-22", "12:30:00", "inflation", "pce"),
 ]
+
+
+def _release_time_utc(date_iso: str, summer_utc: str) -> str:
+    """The schedule holds daylight-saving UTC times; the app prints them as UTC,
+    so a date in US standard time needs the extra hour."""
+    noon_et = datetime.fromisoformat(date_iso).replace(hour=12, tzinfo=ZoneInfo("America/New_York"))
+    if noon_et.utcoffset() == timedelta(hours=-4):
+        return summer_utc
+    return (datetime.strptime(summer_utc, "%H:%M:%S") + timedelta(hours=1)).strftime("%H:%M:%S")
 
 
 def _fmt_pct(v: float, decimals: int = 1) -> str:
@@ -402,7 +464,7 @@ def fetch_events(now: datetime, event_values: dict) -> dict | None:
     for label, date_iso, rel_time, category, source in CURATED_RELEASES:
         if date_iso < from_date or date_iso > to_date:
             continue
-        e = _event(label, date_iso, rel_time, category)
+        e = _event(label, date_iso, _release_time_utc(date_iso, rel_time), category)
         latest, prev = event_values.get(source, (None, None))
         if date_iso >= today_str:
             e["previous"] = latest   # the last reading, shown ahead of the release
